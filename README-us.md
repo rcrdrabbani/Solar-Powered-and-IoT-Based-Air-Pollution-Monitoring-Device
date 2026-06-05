@@ -28,3 +28,11 @@ The firmware is structured using a **Finite State Machine (FSM)** layout to elim
 * **Mechanical & Design:** EasyEDA (PCB Design), Autodesk CAD (Enclosure Scheme).
 
 ---
+## 🚀 How to Use
+
+1. **Hardware Setup:** Ensure your PV system delivers regulated power to the microcontroller. Connect sensors via I2C/SPI or specified Analog Pins.
+2. **Firmware Deployment:** Open the hardware source file in Arduino IDE, install required sensor libraries, configure your Wi-Fi credentials, and flash the ESP32.
+3. **Backend Middleware:** Run the Python script on your host machine/cloud server to start listening to incoming payloads and direct them to your Google Sheets API dashboard.
+
+---
+*Developed by **Ricarda Rabbani** as part of a Capstone Project and Personal Engineering Portfolio.*
