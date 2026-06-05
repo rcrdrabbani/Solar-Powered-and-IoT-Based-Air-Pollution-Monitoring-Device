@@ -1,0 +1,825 @@
+#include <Wire.h>
+#include <time.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <math.h>
+#include <esp_adc_cal.h>
+
+esp_adc_cal_characteristics_t adc_chars;
+
+//==================== WIFI & MQTT ====================//
+const char* wifi_ssid = "testpolutan";
+const char* wifi_password = "testtest";
+
+WiFiClientSecure net;
+PubSubClient Client(net);
+
+const char* mqtt_server = "ab0a0ddc5639442cb34df176c2223551.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "Fitri";
+const char* mqtt_pass = "Fitri171020";
+const char* mqtt_client_id = "ESP32MonPol01";
+const char* MQTT_TOPIC_PUB = "esp32/pub";
+const char* MQTT_TOPIC_LOG = "esp32/log";
+const char* MQTT_TOPIC_SUB = "esp32/control";
+
+//==================== PIN SENSOR ====================//
+#define PM10_LED_PIN 4
+#define PM10_ADC_PIN 36
+#define MQ7_PIN 35im
+#define MQ135_PIN 34
+#define RL_MQ135 10.0
+#define RL_MQ7 10.0
+#define SAMPLE_COUNT 10
+#define MQ_SAMPLE_COUNT 10
+#define ADC_SAMPLE_COUNT 32
+
+//==================== I2C ====================//
+LiquidCrystal_I2C lcd01(0x27, 20, 4);
+LiquidCrystal_I2C lcd02(0x26, 20, 4);
+LiquidCrystal_I2C lcd03(0x25, 20, 4);
+
+struct DataSensor {
+  float value;
+  int adc;
+  float volt;
+};
+DataSensor mq7;
+DataSensor mq135;
+DataSensor gp2y;
+
+float RO_MQ7 = 2.9, RO_MQ135 = 10.0;
+float sumRSMQ7 = 0, sumRSMQ135 = 0;
+float sumMQ7 = 0, sumMQ135 = 0, sumGP2Y = 0;
+float mq7avg = 0, mq135avg = 0, gp2yavg = 0;
+int calCountMQ7 = 0, calCountMQ135 = 0;
+unsigned int sample = 0;
+
+unsigned long startTime = 0;
+unsigned long lastWiFiAttempt = 0;
+const unsigned long wifiInterval = 15000;
+unsigned long lastMQTTAttempt = 0;
+const unsigned long mqttInterval = 15000;
+unsigned long lastSensorRead = 0;
+const unsigned long sensorInterval = 1000;
+unsigned long calibrateStartTime = 0;
+const unsigned long calibrateDuration = 300000;
+unsigned long samplingStartTime = 0;
+const unsigned long samplingDuration = 120000;
+unsigned long warmupStartTime = 0;
+const unsigned long warmupDuration = 300000;
+unsigned long lastLCDUpdate = 0;
+const unsigned long lcdInterval = 1000;
+unsigned long calSample = 0;
+const unsigned long sampleInterval = 1000;
+
+enum SystemState {
+  SYSTEM_WARMUP,
+  SYSTEM_CALIBRATING,
+  SYSTEM_RUNNING
+};
+
+enum WiFiState {
+  WIFI_DISCONNECTED,
+  WIFI_CONNECTING,
+  WIFI_CONNECTED
+};
+
+enum MQTTState {
+  MQTT_STATEDISCONNECTED,
+  MQTT_STATECONNECTING,
+  MQTT_STATECONNECTED
+};
+
+enum SensorState {
+  SENSOR_IDLE,
+  SENSOR_CALIBRATING,
+  SENSOR_SAMPLING
+};
+
+enum LCDState {
+  LCD_WARMUP,
+  LCD_CALIBRATING,
+  LCD_SAMPLING
+};
+
+WiFiState wifiState = WIFI_DISCONNECTED;
+MQTTState mqttState = MQTT_STATEDISCONNECTED;
+SystemState systemState = SYSTEM_WARMUP;
+SystemState lastState = SYSTEM_WARMUP;
+SensorState sensorState = SENSOR_IDLE;
+LCDState lcdState = LCD_WARMUP;
+
+void mqttLog(const char* msg) {
+  Serial.println(msg);
+  if (mqttState == MQTT_STATECONNECTED) {
+    Client.publish(MQTT_TOPIC_LOG, msg);
+  }
+}
+
+bool connectMQTT() {
+  mqttLog("MQTT connecting...");
+
+  if (Client.connect(mqtt_client_id, mqtt_user, mqtt_pass)) {
+    mqttLog("MQTT connected!");
+    Client.subscribe(MQTT_TOPIC_SUB);
+    mqttLog("Subscribe esp32/control OK");
+    return true;
+  } else {
+    char m[50];
+    snprintf(m, sizeof(m), "MQTT failed, rc=%d", Client.state()); // ✅
+    mqttLog(m);
+    return false;
+  }
+}
+
+char TimeMQTT[21];
+void getTimeMQTT(char* buffer) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    strcpy(buffer, "0000-00-00 00:00:00");
+    return;
+  }
+  strftime(buffer, 20, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
+
+void publishMQTT() {
+
+  if (mqttState != MQTT_STATECONNECTED) return;
+
+  char payload[300];
+  char timeStr[21];
+
+  getTimeMQTT(timeStr);
+
+  snprintf(payload, sizeof(payload),
+           "{"
+           "\"device\":\"ESP32MonPol01\","
+           "\"time\":\"%s\","
+           "\"co\":%.2f,"
+           "\"gas\":%.2f,"
+           "\"pm10\":%.2f,"
+           "\"wifi\":%d,"
+           "\"mqtt\":%d"
+           "}",
+           timeStr,
+           mq7avg,
+           mq135avg,
+           gp2yavg,
+           wifiState,
+           mqttState);
+
+  Client.publish(MQTT_TOPIC_PUB, payload);
+}
+
+void printCenter(LiquidCrystal_I2C& lcd, int row, const char* text) {
+  char line[21];
+  int len = strlen(text);
+  int col = (20 - len) / 2;
+  if (col < 0) col = 0;
+
+  memset(line, ' ', 20);
+  line[20] = '\0';
+
+  int copyLen = (len > 20) ? 20 : len;
+  memcpy(&line[col], text, copyLen);
+
+  lcd.setCursor(0, row);
+  lcd.print(line);
+}
+
+void formatTime(char* buffer, unsigned long ms) {
+  unsigned long totalSec = ms / 1000;
+  int minutes = totalSec / 60;
+  int seconds = totalSec % 60;
+
+  sprintf(buffer, "%02d:%02d", minutes, seconds);
+}
+
+char TimeLCD[6];
+void getTimeLCD(char* buffer) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    strcpy(buffer, "00:00");
+    return;
+  }
+  strftime(buffer, 6, "%H:%M", &timeinfo);
+}
+
+int readMQ7ADC() {
+  long sum = 0;
+  for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+    sum += analogRead(MQ7_PIN);
+    delayMicroseconds(500);
+  }
+  return sum / ADC_SAMPLE_COUNT;
+}
+
+int readMQ135ADC() {
+  long sum = 0;
+  for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+    sum += analogRead(MQ135_PIN);
+    delayMicroseconds(500);
+  }
+  return sum / ADC_SAMPLE_COUNT;
+}
+
+int readPM10ADC() {
+  digitalWrite(PM10_LED_PIN, LOW);
+  delayMicroseconds(280);
+
+  int adcValue = analogRead(PM10_ADC_PIN);
+
+  delayMicroseconds(40);
+  digitalWrite(PM10_LED_PIN, HIGH);
+
+  delayMicroseconds(9680);
+
+  return adcValue;
+}
+
+float readVoltageAccurate(int pin) {
+  int raw = analogRead(pin);
+  uint32_t voltage_mv = esp_adc_cal_raw_to_voltage(raw, &adc_chars);
+  return voltage_mv / 1000.0;  // konversi mV ke Volt
+}
+
+float readDustUGM3_fromADC(int adc) {
+  static float buffer[SAMPLE_COUNT];
+  static int index = 0;
+  static bool filled = false;
+
+  float voltage = adc * (3.3 / 4095.0);
+  float Voffset = 0.42;
+
+  float dust_mg = (voltage - Voffset) / 0.5;
+  if (dust_mg < 0) dust_mg = 0;
+
+  float dust_ug = dust_mg * 1000.0;
+
+  buffer[index] = dust_ug;
+  index++;
+
+  if (index >= SAMPLE_COUNT) {
+    index = 0;
+    filled = true;
+  }
+
+  float sum = 0;
+  int count = filled ? SAMPLE_COUNT : index;
+
+  for (int i = 0; i < count; i++) sum += buffer[i];
+
+  return sum / count;
+}
+
+float readMQ7Smooth(float newValue) {
+  static float buffer[MQ_SAMPLE_COUNT];
+  static int index = 0;
+  static bool filled = false;
+
+  buffer[index] = newValue;
+  index++;
+  if (index >= MQ_SAMPLE_COUNT) {
+    index = 0;
+    filled = true;
+  }
+
+  float sum = 0;
+  int count = filled ? MQ_SAMPLE_COUNT : index;
+  for (int i = 0; i < count; i++) sum += buffer[i];
+  return sum / count;
+}
+
+float readMQ135Smooth(float newValue) {
+  static float buffer[MQ_SAMPLE_COUNT];
+  static int index = 0;
+  static bool filled = false;
+
+  buffer[index] = newValue;
+  index++;
+  if (index >= MQ_SAMPLE_COUNT) {
+    index = 0;
+    filled = true;
+  }
+
+  float sum = 0;
+  int count = filled ? MQ_SAMPLE_COUNT : index;
+  for (int i = 0; i < count; i++) sum += buffer[i];
+  return sum / count;
+}
+
+float readMQ7PPM_fromVolt(float Vout) {
+  if (Vout <= 0.01) return 0;
+  float Vc = 5.0;
+  float Rs = (Vc - Vout) / Vout * RL_MQ7;
+  if (RO_MQ7 <= 0) return 0;
+  float ratio = Rs / RO_MQ7;
+  if (ratio <= 0) return 0;
+  return pow(10, (log10(ratio) - 1.7) / -0.77);
+}
+
+float readMQ135PPM_fromVolt(float Vout) {
+  if (Vout < 0.05) Vout = 0.05;
+  float Vc = 5.0;
+  float Rs = (Vc - Vout) / Vout * RL_MQ135;
+  if (RO_MQ135 <= 0) return 0;
+  float ratio = Rs / RO_MQ135;
+  if (ratio <= 0) return 0;
+  return pow(10, (log10(ratio) - 1.5) / -0.38);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  char msg[150];
+  if (length >= sizeof(msg)) return;
+  memcpy(msg, payload, length);
+  msg[length] = '\0';
+
+  char logBuf[150];
+  snprintf(logBuf, sizeof(logBuf), "Pesan masuk [%s]: %s", topic, msg);
+  mqttLog(logBuf);
+
+  char cmd[20];
+  char arg[20];
+
+  int parsed = sscanf(msg, "%19s %19s", cmd, arg);
+
+  if (parsed < 1) return;
+
+  if (strcmp(cmd, "ro7") == 0) {
+    if (parsed < 2) {
+      char m[60];
+      snprintf(m, sizeof(m), "RO_MQ7 saat ini: %.4f", RO_MQ7);
+      mqttLog(m);
+      return;
+    }
+
+    float val = atof(arg);
+    if (val > 0 && val < 1000) {
+      RO_MQ7 = val;
+      char m[60];
+      snprintf(m, sizeof(m), "RO_MQ7 diubah ke: %.4f", RO_MQ7);
+      mqttLog(m);
+    } else {
+      mqttLog("ro7: nilai tidak valid (harus 0-1000)");
+    }
+
+  } else if (strcmp(cmd, "ro135") == 0) {
+    if (parsed < 2) {
+      char m[60];
+      snprintf(m, sizeof(m), "RO_MQ135 saat ini: %.4f", RO_MQ135);
+      mqttLog(m);
+      return;
+    }
+    float val = atof(arg);
+    if (val > 0 && val < 1000) {
+      RO_MQ135 = val;
+      char m[60];
+      snprintf(m, sizeof(m), "RO_MQ135 diubah ke: %.4f", RO_MQ135);
+      mqttLog(m);
+    } else {
+      mqttLog("ro135: nilai tidak valid (harus 0-1000)");
+    }
+
+  } else if (strcmp(cmd, "skip") == 0) {
+    if (parsed < 2) {
+      mqttLog("skip: butuh argumen (warmup / calibrating)");
+      return;
+    }
+    if (strcmp(arg, "warmup") == 0) {
+      if (systemState == SYSTEM_WARMUP) {
+        systemState = SYSTEM_CALIBRATING;
+        mqttLog("Skip warmup! Lanjut ke kalibrasi.");
+      } else {
+        mqttLog("Skip warmup diabaikan, bukan di state warmup.");
+      }
+    } else if (strcmp(arg, "calibrating") == 0) {
+      if (systemState == SYSTEM_CALIBRATING) {
+        systemState = SYSTEM_RUNNING;
+        mqttLog("Skip kalibrasi! Lanjut ke sampling.");
+      } else {
+        mqttLog("Skip kalibrasi diabaikan, bukan di state kalibrasi.");
+      }
+    } else {
+      mqttLog("skip: argumen tidak dikenal (warmup / calibrating)");
+    }
+
+  } else if (strcmp(cmd, "status") == 0) {
+    char m[100];
+    snprintf(m, sizeof(m),
+             "RO_MQ7:%.4f | RO_MQ135:%.4f | State:%d",
+             RO_MQ7, RO_MQ135, systemState);
+    mqttLog(m);
+
+  } else if (strcmp(cmd, "reset") == 0) {
+    mqttLog("Reset ESP32 dalam 2 detik...");
+    Client.loop();
+    delay(2000);
+    ESP.restart();
+
+  } else {
+    char m[60];
+    snprintf(m, sizeof(m), "Perintah tidak dikenal: %s", cmd);
+    mqttLog(m);
+  }
+}
+
+void handleWiFi() {
+  wl_status_t status = WiFi.status();
+
+  switch (wifiState) {
+
+    case WIFI_CONNECTED:
+      if (status != WL_CONNECTED) {
+        mqttLog("WiFi lost connection");
+        wifiState = WIFI_DISCONNECTED;
+      }
+      break;
+
+    case WIFI_DISCONNECTED:
+      if (millis() - lastWiFiAttempt >= wifiInterval) {
+        lastWiFiAttempt = millis();
+        mqttLog("WiFi start connecting...");
+        WiFi.begin(wifi_ssid, wifi_password);
+        wifiState = WIFI_CONNECTING;
+      }
+      break;
+
+    case WIFI_CONNECTING:
+      if (status == WL_CONNECTED) {
+        mqttLog("WiFi connected!");
+        wifiState = WIFI_CONNECTED;
+      } else if (millis() - lastWiFiAttempt >= wifiInterval) {
+        mqttLog("WiFi retry...");
+        WiFi.begin(wifi_ssid, wifi_password);
+        lastWiFiAttempt = millis();
+      }
+      break;
+  }
+}
+
+void handleMQTT() {
+  if (wifiState != WIFI_CONNECTED) {
+    mqttState = MQTT_STATEDISCONNECTED;
+    return;
+  }
+
+  switch (mqttState) {
+
+    case MQTT_STATECONNECTED:
+      if (!Client.connected()) {
+        mqttLog("MQTT lost connection");
+        mqttState = MQTT_STATEDISCONNECTED;
+      } else {
+        Client.loop();
+      }
+      break;
+
+    case MQTT_STATEDISCONNECTED:
+      if (millis() - lastMQTTAttempt >= mqttInterval) {
+        lastMQTTAttempt = millis();
+        if (connectMQTT()) {
+          mqttState = MQTT_STATECONNECTED;
+        } else {
+          mqttState = MQTT_STATECONNECTING;
+        }
+      }
+      break;
+
+    case MQTT_STATECONNECTING:
+      if (Client.connected()) {
+        mqttLog("MQTT connected!");
+        mqttState = MQTT_STATECONNECTED;
+      } else if (millis() - lastMQTTAttempt >= mqttInterval) {
+        mqttLog("MQTT retry...");
+        lastMQTTAttempt = millis();
+        if (connectMQTT()) {
+          mqttState = MQTT_STATECONNECTED;
+        }
+      }
+      break;
+  }
+}
+
+void handleSystem() {
+
+  if (systemState != lastState) {
+
+    switch (systemState) {
+
+      case SYSTEM_WARMUP:
+        sensorState = SENSOR_IDLE;
+        lcdState = LCD_WARMUP;
+        warmupStartTime = millis();
+        break;
+
+      case SYSTEM_CALIBRATING:
+        sensorState = SENSOR_CALIBRATING;
+        lcdState = LCD_CALIBRATING;
+        calibrateStartTime = millis();
+        calSample = millis();
+        sumRSMQ7 = 0;
+        sumRSMQ135 = 0;
+        calCountMQ7 = 0;
+        calCountMQ135 = 0;
+        break;
+
+      case SYSTEM_RUNNING:
+        sensorState = SENSOR_SAMPLING;
+        lcdState = LCD_SAMPLING;
+        samplingStartTime = millis();
+        sumMQ7 = 0;
+        sumMQ135 = 0;
+        sumGP2Y = 0;
+        sample = 0;
+        break;
+    }
+    lastState = systemState;
+  }
+  switch (systemState) {
+
+    case SYSTEM_WARMUP:
+      if (millis() - warmupStartTime >= warmupDuration) {
+        systemState = SYSTEM_CALIBRATING;
+      }
+      break;
+
+    case SYSTEM_CALIBRATING:
+      if (millis() - calibrateStartTime >= calibrateDuration) {
+        RO_MQ7 = 2.9;
+        RO_MQ135 = 10.0;
+        systemState = SYSTEM_RUNNING;
+      }
+      break;
+  }
+}
+
+void handleSensor() {
+  if (millis() - lastSensorRead < sensorInterval) return;
+  lastSensorRead = millis();
+
+  switch (sensorState) {
+    case SENSOR_IDLE:
+      break;
+
+    case SENSOR_CALIBRATING:
+      {
+        if (millis() - calSample >= sampleInterval) {
+          calSample = millis();
+
+          int adcMQ7 = readMQ7ADC();
+          int adcMQ135 = readMQ135ADC();
+
+          uint32_t mv7 = esp_adc_cal_raw_to_voltage(adcMQ7, &adc_chars);
+          uint32_t mv135 = esp_adc_cal_raw_to_voltage(adcMQ135, &adc_chars);
+          float Vout7 = mv7 / 1000.0;
+          float Vout135 = mv135 / 1000.0;
+
+          // Guard hanya untuk MQ7
+          if (Vout7 <= 0.01) {
+            mqttLog("Sample dibuang! MQ7 Vout terlalu kecil.");
+            break;
+          }
+
+          float Rs7 = (5.0 - Vout7) / Vout7 * RL_MQ7;
+          if (Rs7 <= 0 || isinf(Rs7)) {
+            mqttLog("Sample dibuang! Rs7 tidak valid.");
+            break;
+          }
+
+          // MQ135 pakai Vout minimum 0.05 agar tidak div/0
+          float Vout135safe = (Vout135 < 0.05) ? 0.05 : Vout135;
+          float Rs135 = (5.0 - Vout135safe) / Vout135safe * RL_MQ135;
+
+          sumRSMQ7 += Rs7;
+          sumRSMQ135 += Rs135;
+
+          calCountMQ7++;
+          calCountMQ135++;
+        }
+        break;
+      }
+
+    case SENSOR_SAMPLING:
+      {
+        int adcMQ7 = readMQ7ADC();
+        uint32_t mv7 = esp_adc_cal_raw_to_voltage(adcMQ7, &adc_chars);
+        mq7.adc = adcMQ7;
+        mq7.volt = mv7 / 1000.0;
+        mq7.value = readMQ7Smooth(readMQ7PPM_fromVolt(mq7.volt));
+
+        int adcMQ135 = readMQ135ADC();
+        uint32_t mv135 = esp_adc_cal_raw_to_voltage(adcMQ135, &adc_chars);
+        mq135.adc = adcMQ135;
+        mq135.volt = mv135 / 1000.0;
+        mq135.value = readMQ135Smooth(readMQ135PPM_fromVolt(mq135.volt));
+
+
+        gp2y.adc = readPM10ADC();
+        uint32_t mvGP2Y = esp_adc_cal_raw_to_voltage(gp2y.adc, &adc_chars);
+        gp2y.volt = mvGP2Y / 1000.0;
+        gp2y.value = readDustUGM3_fromADC(gp2y.adc);
+
+        sumMQ7 += mq7.value;
+        sumMQ135 += mq135.value;
+        sumGP2Y += gp2y.value;
+        sample++;
+
+        if (millis() - samplingStartTime >= samplingDuration && sample > 0) {
+          mq7avg = sumMQ7 / sample;
+          mq135avg = sumMQ135 / sample;
+          gp2yavg = sumGP2Y / sample;
+
+          publishMQTT();
+
+          sumMQ7 = 0;
+          sumMQ135 = 0;
+          sumGP2Y = 0;
+          sample = 0;
+          samplingStartTime = millis();
+        }
+        break;
+      }
+  }
+}
+
+void handleLCD() {
+  if (millis() - lastLCDUpdate < lcdInterval) return;
+  lastLCDUpdate = millis();
+
+  switch (lcdState) {
+
+    case LCD_WARMUP:
+      {
+        //01
+        printCenter(lcd01, 0, "WiFi Status");
+        if (wifiState == WIFI_CONNECTED)
+          printCenter(lcd01, 1, "CONNECTED");
+        else if (wifiState == WIFI_CONNECTING)
+          printCenter(lcd01, 1, "CONNECTING");
+        else
+          printCenter(lcd01, 1, "DISCONNECTED");
+        //02
+        unsigned long elapsed = millis() - warmupStartTime;
+        unsigned long remaining = (elapsed >= warmupDuration)
+                                    ? 0
+                                    : (warmupDuration - elapsed);
+
+        char timeStr[6];
+        formatTime(timeStr, remaining);
+
+        printCenter(lcd02, 1, "Warming Up...");
+        printCenter(lcd02, 2, timeStr);
+        //03
+        printCenter(lcd03, 0, "MQTT Status");
+
+        if (mqttState == MQTT_STATECONNECTED)
+          printCenter(lcd03, 1, "CONNECTED");
+        else if (mqttState == MQTT_STATECONNECTING)
+          printCenter(lcd03, 1, "CONNECTING");
+        else
+          printCenter(lcd03, 1, "DISCONNECTED");
+        break;
+      }
+
+    case LCD_CALIBRATING:
+      {
+        //01
+        char lineMQ7[21];
+        snprintf(lineMQ7, sizeof(lineMQ7), "Sample : %d", calCountMQ7);
+
+        printCenter(lcd01, 1, "MQ7");
+        printCenter(lcd01, 2, lineMQ7);
+        //02
+        unsigned long elapsed = millis() - calibrateStartTime;
+        unsigned long remaining = (elapsed >= calibrateDuration)
+                                    ? 0
+                                    : (calibrateDuration - elapsed);
+
+        char timeStr[6];
+        formatTime(timeStr, remaining);
+
+        printCenter(lcd02, 1, "Calibrating...");
+        printCenter(lcd02, 2, timeStr);
+        //03
+        char lineMQ135[21];
+        snprintf(lineMQ135, sizeof(lineMQ135), "MQ135 Samp: %d", calCountMQ135);
+
+        printCenter(lcd03, 0, "MQ135");
+        printCenter(lcd03, 1, lineMQ135);
+        break;
+      }
+
+    case LCD_SAMPLING:
+      {
+
+        char line1[21];
+        char line2[21];
+        char line3[21];
+        char timeStr[10];
+
+        // ===== LCD 1 =====
+        snprintf(line1, sizeof(line1), "CO");
+        printCenter(lcd01, 0, line1);
+
+        snprintf(line1, sizeof(line1), "%.1f PPM", mq7avg);
+        printCenter(lcd01, 1, line1);
+
+        snprintf(line1, sizeof(line1), "ADC:%d | V:%.2f", mq7.adc, mq7.volt);
+        printCenter(lcd01, 2, line1);
+
+        snprintf(line1, sizeof(line1), "WiFi:%d MQTT:%d", wifiState, mqttState);
+        printCenter(lcd01, 3, line1);
+
+        // ===== LCD 2 =====
+        snprintf(line2, sizeof(line2), "Gas Polutan");
+        printCenter(lcd02, 0, line2);
+
+        snprintf(line2, sizeof(line2), "%.1f PPM", mq135avg);
+        printCenter(lcd02, 1, line2);
+
+        snprintf(line2, sizeof(line2), "ADC:%d | V:%.2f", mq135.adc, mq135.volt);
+        printCenter(lcd02, 2, line2);
+
+        snprintf(line2, sizeof(line2), "MQ7:%.2f MQ135:%.2f", RO_MQ7, RO_MQ135);
+        printCenter(lcd02, 3, line2);
+
+        // ===== LCD 3 =====
+        snprintf(line3, sizeof(line3), "PM10");
+        printCenter(lcd03, 0, line3);
+
+        snprintf(line3, sizeof(line3), "%.1f ug/m3", gp2yavg);
+        printCenter(lcd03, 1, line3);
+
+        snprintf(line3, sizeof(line3), "ADC:%d | V:%.2f", gp2y.adc, gp2y.volt);
+        printCenter(lcd03, 2, line3);
+
+        getTimeLCD(timeStr);
+        printCenter(lcd03, 3, timeStr);
+
+        break;
+      }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // ===================== PIN MODE ===================== //
+  pinMode(PM10_LED_PIN, OUTPUT);
+  digitalWrite(PM10_LED_PIN, HIGH);
+
+  pinMode(MQ7_PIN, INPUT);
+  pinMode(MQ135_PIN, INPUT);
+  pinMode(PM10_ADC_PIN, INPUT);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PM10_ADC_PIN, ADC_11db);
+  analogSetPinAttenuation(MQ7_PIN, ADC_11db);
+  analogSetPinAttenuation(MQ135_PIN, ADC_11db);
+
+  esp_adc_cal_characterize(
+    ADC_UNIT_1,
+    ADC_ATTEN_DB_11,
+    ADC_WIDTH_BIT_12,
+    1100,
+    &adc_chars);
+
+  // ===================== LCD INIT ===================== //
+  Wire.begin(21, 22);
+  lcd01.init();
+  lcd01.backlight();
+
+  lcd02.init();
+  lcd02.backlight();
+
+  lcd03.init();
+  lcd03.backlight();
+
+  // ===================== WIFI SETUP ===================== //
+  WiFi.mode(WIFI_STA);
+  wifiState = WIFI_CONNECTING;
+  WiFi.begin(wifi_ssid, wifi_password);
+  lastWiFiAttempt = millis();
+
+  // ===================== MQTT SETUP ===================== //
+  net.setInsecure();
+  Client.setServer(mqtt_server, mqtt_port);
+  Client.setCallback(mqttCallback);
+  Client.setKeepAlive(60);
+  Client.setBufferSize(512);
+  // ===================== TIME (NTP) ===================== //
+  configTime(7 * 3600, 0, "pool.ntp.org");
+
+  warmupStartTime = millis();
+}
+
+void loop() {
+  handleSystem();
+  handleWiFi();
+  handleMQTT();
+  handleSensor();
+  handleLCD();
+}
