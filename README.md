@@ -15,4 +15,4 @@ Selamat datang di repositori resmi proyek Tugas Akhir Solar-Powered Air Pollutio
 *Berisi spesifikasi teknis lengkap, arsitektur desain firmware FSM, konfigurasi REST API Python, dan panduan integrasi telemetri cloud.*
 
 ---
-*Developed by **Ricarda Rabbani** as part of a Personal Engineering Portfolio.*
+*Developed by **Ricarda Rabbani** as part of a Capstone Project and Personal Engineering Portfolio.*
